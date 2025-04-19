@@ -1,0 +1,6 @@
+/.mypy_cache
+/build
+/dist
+/mfl_scanner.log
+/plot.spec
+/venv
