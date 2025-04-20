@@ -4,3 +4,5 @@
 /mfl_scanner.log
 /plot.spec
 /venv
+/calibration.json
+/measurements.json

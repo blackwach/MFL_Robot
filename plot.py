@@ -1,5 +1,6 @@
 import time
 import numpy as np
+from scipy.interpolate import interp1d
 import matplotlib.pyplot as plt
 from pymodbus.client import ModbusTcpClient
 from pymodbus.payload import BinaryPayloadDecoder
@@ -13,6 +14,7 @@ import traceback
 from datetime import datetime, timedelta
 import csv
 from tkinter import filedialog
+import json
 
 
 class Register:
@@ -38,6 +40,25 @@ class MFLScannerApp:
         self.initialize_variables()
         self.setup_logging()
         self.create_gui_elements()
+
+        self.calib_listbox = None
+        self.calib_hall_value = tk.DoubleVar()  # Для значения датчика при калибровке
+        self.calib_thickness = tk.DoubleVar()   # Для толщины при калибровке
+        self.calibration_points = []            # Список точек калибровки [(значение, толщина)]
+        self.last_measurements = []
+        self.max_measurements = 10
+        
+        self.hall_min_range = tk.DoubleVar(value=-670.0)
+        self.hall_max_range = tk.DoubleVar(value=670.0)
+
+        self.create_hall_range_settings()
+
+        # Загружаем сохраненные данные при старте
+        self.load_saved_data()
+
+        self.create_calibration_panel()
+        self.create_last_measurements_panel()
+
 
     def initialize_variables(self):
         """Инициализация основных переменных"""
@@ -210,6 +231,60 @@ class MFLScannerApp:
             ttk.Button(subframe, text="График",
                       command=lambda r=reg.name: self.show_history_graph(r)).pack(side="right", padx=5)
 
+    def create_hall_range_settings(self):
+        """Панель настройки диапазона датчиков Холла"""
+        frame = ttk.LabelFrame(self.root, text="Настройка датчиков Холла")
+        frame.pack(padx=10, pady=5, fill="x")
+        
+        # Минимальное значение
+        ttk.Label(frame, text="Минимальное значение:").grid(row=0, column=0, sticky="e")
+        ttk.Entry(frame, textvariable=self.hall_min_range, width=10).grid(row=0, column=1, sticky="w")
+        
+        # Максимальное значение
+        ttk.Label(frame, text="Максимальное значение:").grid(row=1, column=0, sticky="e")
+        ttk.Entry(frame, textvariable=self.hall_max_range, width=10).grid(row=1, column=1, sticky="w")
+        
+        # Кнопка применения
+        ttk.Button(frame, text="Применить диапазон", 
+                 command=self.apply_hall_range).grid(row=2, columnspan=2, pady=5)
+
+    def apply_hall_range(self):
+        """Применение выбранного диапазона датчиков"""
+        try:
+            min_val = self.hall_min_range.get()
+            max_val = self.hall_max_range.get()
+            
+            if min_val >= max_val:
+                messagebox.showerror("Ошибка", "Минимальное значение должно быть меньше максимального")
+                return
+            
+            # Проверяем, что текущие значения в новом диапазоне
+            for point in self.calibration_points:
+                if not (min_val <= point[0] <= max_val):
+                    messagebox.showerror("Ошибка", 
+                                       f"Точка калибровки {point[0]} вне нового диапазона")
+                    return
+            
+            messagebox.showinfo("Успех", "Диапазон датчиков успешно изменен")
+            
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Ошибка изменения диапазона: {str(e)}")
+
+    def normalize_hall_value(self, value):
+        """Нормализация значения датчика к диапазону [-1, 1]"""
+        min_val = self.hall_min_range.get()
+        max_val = self.hall_max_range.get()
+        
+        # Ограничиваем значение указанным диапазоном
+        clamped_value = max(min(value, max_val), min_val)
+        
+        # Нормализуем к [-1, 1]
+        range_center = (max_val + min_val) / 2
+        range_half = (max_val - min_val) / 2
+        
+        return (clamped_value - range_center) / range_half
+
+
     def create_history_panel(self, parent):
         """Панель для работы с историей данных"""
         frame = ttk.LabelFrame(parent, text="История измерений")
@@ -366,17 +441,55 @@ class MFLScannerApp:
                     self.history[name]['values'].append(value)
                     self.history[name]['timestamps'].append(timestamp)
 
-    def calculate_thickness(self, gauss_value, temperature):
-        """Расчёт толщины металла с учётом температуры"""
+    def calculate_thickness(self, hall_value, temperature=20.0):
+        """
+        Корректный расчет толщины металла с учетом:
+        - калибровки датчика
+        - температурной компенсации
+        - физических ограничений
+        """
         try:
-            temp_coef = 0.003  # температурный коэффициент
-            normalized_gauss = gauss_value / 1000  # нормализация показаний датчика
-            temp_factor = 1 + temp_coef * (temperature - 20)  # коррекция на температуру
-            thickness = self.base_thickness.get() - (self.material_coef.get() * normalized_gauss * temp_factor)
-            return max(thickness, 0.1)  # минимальная толщина 0.1 мм
+            # 1. Проверка и ограничение входного значения
+            min_val = self.hall_min_range.get()
+            max_val = self.hall_max_range.get()
+            hall_value = np.clip(hall_value, min_val, max_val)
+            
+            # 2. Если есть точки калибровки, используем интерполяцию
+            if len(self.calibration_points) >= 2:
+                # Сортируем точки калибровки по значению датчика
+                sorted_points = sorted(self.calibration_points, key=lambda x: x[0])
+                x = [p[0] for p in sorted_points]
+                y = [p[1] for p in sorted_points]
+                
+                # Создаем интерполяционную функцию
+                interp_func = interp1d(
+                    x, y, 
+                    kind='linear',
+                    bounds_error=False,
+                    fill_value=(y[0], y[-1]))  # Экстраполяция крайними значениями
+                
+                # Получаем толщину без учета температуры
+                base_thickness = float(interp_func(hall_value))
+            else:
+                # 3. Если калибровки нет, используем стандартную формулу
+                normalized = ((hall_value - min_val) / (max_val - min_val))
+                
+                # Линейная зависимость (можно заменить на более сложную модель)
+                base_thickness = self.base_thickness.get() - (
+                    (normalized - 0.5) * 2 * self.material_coef.get() * 100)
+            
+            # 4. Температурная компенсация
+            temp_coef = 0.003  # Коэффициент температурного расширения
+            temp_factor = 1 + temp_coef * (temperature - 20)
+            thickness = base_thickness * temp_factor
+            
+            # 5. Физические ограничения
+            return max(min(thickness, self.base_thickness.get() * 1.5), 0.1)
+            
         except Exception as e:
-            self.logger.error(f"Ошибка расчёта толщины: {str(e)}")
-            return 0.1
+            self.logger.error(f"Ошибка расчета толщины: {str(e)}\n{traceback.format_exc()}")
+            return 0.1  # Возвращаем минимальную толщину при ошибке
+
 
     def visualize_data(self):
         """Визуализация данных в 3D"""
@@ -737,6 +850,305 @@ class MFLScannerApp:
         except Exception as e:
             self.logger.error(f"Ошибка построения графика толщины: {str(e)}\n{traceback.format_exc()}")
             messagebox.showerror("Ошибка", f"Ошибка при построении графика толщины: {str(e)}")
+
+    def create_calibration_panel(self):
+        """Панель калибровки датчика Холла"""
+        frame = ttk.LabelFrame(self.root, text="Калибровка датчика Холла")
+        frame.pack(padx=10, pady=5, fill="x")
+
+        # Поля ввода для калибровки
+        ttk.Label(frame, text="Значение датчика:").grid(row=0, column=0, sticky="e")
+        ttk.Entry(frame, textvariable=self.calib_hall_value, width=10).grid(row=0, column=1)
+        
+        ttk.Label(frame, text="Толщина (мм):").grid(row=1, column=0, sticky="e")
+        ttk.Entry(frame, textvariable=self.calib_thickness, width=10).grid(row=1, column=1)
+        
+        # Кнопки управления
+        ttk.Button(frame, text="Добавить точку", 
+                command=self.add_calibration_point).grid(row=0, column=2, padx=5)
+        ttk.Button(frame, text="Сбросить калибровку", 
+                command=self.reset_calibration).grid(row=1, column=2, padx=5)
+        
+        # Список точек калибровки с полосой прокрутки
+        list_frame = ttk.Frame(frame)
+        list_frame.grid(row=2, columnspan=3, sticky="ew", pady=5)
+        
+        # Создаем Listbox и Scrollbar
+        self.calib_listbox = tk.Listbox(list_frame, height=4)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.calib_listbox.yview)
+        self.calib_listbox.configure(yscrollcommand=scrollbar.set)
+        
+        self.calib_listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Кнопка сохранения калибровки
+        ttk.Button(frame, text="Сохранить калибровку", 
+                command=self.save_calibration_data).grid(row=3, columnspan=3, pady=5)
+        
+        # Обновляем список
+        self.update_calib_list()
+
+    def create_last_measurements_panel(self):
+        """Панель последних сохраненных измерений"""
+        frame = ttk.LabelFrame(self.root, text="Последние измерения")
+        frame.pack(padx=10, pady=5, fill="both", expand=True)
+        
+        # Таблица измерений
+        columns = ("timestamp", "distance", "hall_value", "thickness")
+        self.measurements_tree = ttk.Treeview(frame, columns=columns, show="headings")
+        
+        # Настройка колонок
+        self.measurements_tree.heading("timestamp", text="Время")
+        self.measurements_tree.heading("distance", text="Расстояние, м")
+        self.measurements_tree.heading("hall_value", text="Значение датчика")
+        self.measurements_tree.heading("thickness", text="Толщина, мм")
+        
+        self.measurements_tree.column("timestamp", width=150)
+        self.measurements_tree.column("distance", width=100)
+        self.measurements_tree.column("hall_value", width=100)
+        self.measurements_tree.column("thickness", width=100)
+        
+        # Полоса прокрутки
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.measurements_tree.yview)
+        self.measurements_tree.configure(yscrollcommand=scrollbar.set)
+        
+        self.measurements_tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Кнопки управления
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill="x", pady=5)
+        
+        ttk.Button(btn_frame, text="Сохранить текущее", 
+                  command=self.save_current_measurement).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Экспорт в CSV", 
+                  command=self.export_measurements).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Очистить историю", 
+                  command=self.clear_measurements).pack(side="right", padx=5)
+
+    def update_calib_list(self):
+        """Обновление списка калибровки"""
+        self.calib_listbox.delete(0, tk.END)
+        for h, t in self.calibration_points:
+            self.calib_listbox.insert(tk.END, f"{h:>7.1f}  →  {t:.2f} мм")
+
+    def add_calibration_point(self):
+        """Добавление точки калибровки с проверкой"""
+        try:
+            hall_val = self.calib_hall_value.get()
+            thickness = self.calib_thickness.get()
+            
+            # Проверка диапазона
+            if not (self.hall_min_range.get() <= hall_val <= self.hall_max_range.get()):
+                raise ValueError("Значение датчика вне допустимого диапазона")
+            
+            if thickness <= 0:
+                raise ValueError("Толщина должна быть положительной")
+            
+            # Добавляем или обновляем точку
+            existing_idx = next((i for i, (h, _) in enumerate(self.calibration_points) 
+                              if abs(h - hall_val) < 1.0), None)
+            
+            if existing_idx is not None:
+                self.calibration_points[existing_idx] = (hall_val, thickness)
+            else:
+                self.calibration_points.append((hall_val, thickness))
+            
+            # Сортируем по значению датчика
+            self.calibration_points.sort()
+            self.update_calib_list()
+            
+            # Пересчитываем все толщины
+            self.update_thickness_calculation()
+            
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Невозможно добавить точку: {str(e)}")
+
+    def reset_calibration(self):
+        """Сброс калибровки"""
+        self.calibration_points = []
+        self.update_calibration_list()
+        self.save_calibration_data()
+        messagebox.showinfo("Информация", "Калибровка сброшена")
+
+    def update_calibration_list(self):
+        """Обновление списка точек калибровки"""
+        self.calibration_listbox.delete(0, tk.END)
+        for point in sorted(self.calibration_points, key=lambda x: x[0]):
+            self.calibration_listbox.insert(tk.END, f"{point[0]:.1f} → {point[1]:.2f} мм")
+
+    def update_thickness_calculation(self):
+        """Полный пересчет толщин для всех данных"""
+        if not hasattr(self, 'scan_data'):
+            return
+            
+        # Пересчитываем все значения
+        self.scan_data["thickness"] = [
+            self.calculate_thickness(val) 
+            for val in self.scan_data["front_sensor"]
+        ]
+        
+        # Обновляем графики
+        if hasattr(self, 'current_plot'):
+            if self.current_plot == "thickness":
+                self.plot_thickness()
+            elif self.current_plot == "3d":
+                self.visualize_data()
+
+    def calculate_thickness(self, hall_value, temperature=None):
+        """Расчет толщины с учетом калибровки"""
+        try:
+            # Если есть точки калибровки, используем их
+            if self.calibration_points and len(self.calibration_points) >= 2:
+                # Сортируем точки по значению датчика
+                sorted_points = sorted(self.calibration_points, key=lambda x: x[0])
+                x = [p[0] for p in sorted_points]
+                y = [p[1] for p in sorted_points]
+                
+                # Линейная интерполяция между точками
+                thickness = np.interp(hall_value, x, y)
+            else:
+                # Стандартный расчет, если калибровки нет
+                temp_coef = 0.003
+                normalized_hall = hall_value / 670  # Нормализация к [-1, 1]
+                
+                if temperature is not None:
+                    temp_factor = 1 + temp_coef * (temperature - 20)
+                else:
+                    temp_factor = 1
+                
+                thickness = self.base_thickness.get() - (self.material_coef.get() * normalized_hall * temp_factor)
+            
+            return max(thickness, 0.1)  # Минимальная толщина 0.1 мм
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка расчета толщины: {str(e)}")
+            return 0.1
+
+    def save_current_measurement(self):
+        """Сохранение текущего измерения"""
+        try:
+            if not self.scan_data or not self.scan_data.get("distances"):
+                messagebox.showerror("Ошибка", "Нет данных для сохранения")
+                return
+            
+            # Берем последние значения
+            last_idx = -1
+            measurement = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "distance": self.scan_data["distances"][last_idx],
+                "hall_value": self.scan_data["front_sensor"][last_idx],
+                "thickness": self.scan_data["thickness"][last_idx] if "thickness" in self.scan_data else 0
+            }
+            
+            # Добавляем в начало списка
+            self.last_measurements.insert(0, measurement)
+            
+            # Ограничиваем количество сохраненных измерений
+            if len(self.last_measurements) > self.max_measurements:
+                self.last_measurements = self.last_measurements[:self.max_measurements]
+            
+            # Обновляем таблицу
+            self.update_measurements_table()
+            
+            # Сохраняем в файл
+            self.save_measurements_data()
+            
+            messagebox.showinfo("Успех", "Измерение сохранено")
+            
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Ошибка сохранения: {str(e)}")
+
+    def update_measurements_table(self):
+        """Обновление таблицы последних измерений"""
+        self.measurements_tree.delete(*self.measurements_tree.get_children())
+        
+        for meas in self.last_measurements:
+            self.measurements_tree.insert("", "end", values=(
+                meas["timestamp"],
+                f"{meas['distance']:.3f}",
+                f"{meas['hall_value']:.1f}",
+                f"{meas['thickness']:.2f}"
+            ))
+
+    def clear_measurements(self):
+        """Очистка истории измерений"""
+        self.last_measurements = []
+        self.update_measurements_table()
+        self.save_measurements_data()
+        messagebox.showinfo("Информация", "История измерений очищена")
+
+    def export_measurements(self):
+        """Экспорт измерений в CSV"""
+        try:
+            if not self.last_measurements:
+                messagebox.showerror("Ошибка", "Нет данных для экспорта")
+                return
+            
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+                title="Сохранить измерения"
+            )
+            
+            if not filename:
+                return
+            
+            with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.writer(csvfile)
+                
+                # Заголовки
+                writer.writerow(["Время", "Расстояние (м)", "Значение датчика", "Толщина (мм)"])
+                
+                # Данные
+                for meas in self.last_measurements:
+                    writer.writerow([
+                        meas["timestamp"],
+                        f"{meas['distance']:.3f}",
+                        f"{meas['hall_value']:.1f}",
+                        f"{meas['thickness']:.2f}"
+                    ])
+            
+            messagebox.showinfo("Успех", f"Данные экспортированы в {filename}")
+            
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Ошибка экспорта: {str(e)}")
+
+    def load_saved_data(self):
+        """Загрузка сохраненных данных при запуске"""
+        try:
+            # Загрузка калибровки
+            try:
+                with open("calibration.json", "r") as f:
+                    self.calibration_points = json.load(f)
+            except FileNotFoundError:
+                self.calibration_points = []
+            
+            # Загрузка измерений
+            try:
+                with open("measurements.json", "r") as f:
+                    self.last_measurements = json.load(f)
+            except FileNotFoundError:
+                self.last_measurements = []
+                
+        except Exception as e:
+            self.logger.error(f"Ошибка загрузки данных: {str(e)}")
+
+    def save_calibration_data(self):
+        """Сохранение данных калибровки"""
+        try:
+            with open("calibration.json", "w") as f:
+                json.dump(self.calibration_points, f)
+        except Exception as e:
+            self.logger.error(f"Ошибка сохранения калибровки: {str(e)}")
+
+    def save_measurements_data(self):
+        """Сохранение истории измерений"""
+        try:
+            with open("measurements.json", "w") as f:
+                json.dump(self.last_measurements, f)
+        except Exception as e:
+            self.logger.error(f"Ошибка сохранения измерений: {str(e)}")
 
     def add_register(self):
         """Окно добавления нового регистра"""
