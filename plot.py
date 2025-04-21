@@ -31,46 +31,122 @@ class Register:
         self.max_value = max_val
 
 
+class ThicknessCalculator:
+    def __init__(self):
+        self.material_params = {
+            'mu': 5000,         # Магнитная проницаемость
+            'Ms': 1.6e6,        # Намагниченность насыщения (А/м)
+            'alpha': 0.003,     # Температурный коэффициент
+            'h': 0.002          # Расстояние до поверхности (м)
+        }
+        self.calibration_points = []
+
+    def set_material_params(self, mu, Ms, alpha, h):
+        """Установка параметров материала"""
+        self.material_params = {
+            'mu': mu,
+            'Ms': Ms,
+            'alpha': alpha,
+            'h': h
+        }
+
+    def add_calibration_point(self, hall_value, thickness):
+        """Добавление точки калибровки"""
+        self.calibration_points.append((hall_value, thickness))
+        self.calibration_points.sort()
+
+    def calculate(self, hall_value, temperature=20.0):
+        """Основная функция расчета"""
+        try:
+            params = self.material_params
+            temp_factor = 1 + params['alpha'] * (temperature - 20)
+
+            if self.calibration_points:
+                # Интерполяция по калибровочным точкам
+                x = [p[0] for p in self.calibration_points]
+                y = [p[1] for p in self.calibration_points]
+                return np.interp(hall_value, x, y)
+            else:
+                # Аналитическая модель
+                C = (params['mu'] * params['Ms'] * params['h']) / 2
+                return max(C / (abs(hall_value) + 1e-10) * temp_factor, 0.1)
+
+        except Exception as e:
+            print(f"Calculation error: {str(e)}")
+            return 0.1
+
+
 class MFLScannerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("MFL Сканер Визуализация ПРО by Biryukov")
-        
+
         # Инициализация переменных
         self.initialize_variables()
         self.setup_logging()
+
+        # Создаем вкладки
+        self.create_tabs()
+        
+        # Создаем GUI элементы
         self.create_gui_elements()
 
-        self.calib_listbox = None
-        self.calib_hall_value = tk.DoubleVar()  # Для значения датчика при калибровке
-        self.calib_thickness = tk.DoubleVar()   # Для толщины при калибровке
-        self.calibration_points = []            # Список точек калибровки [(значение, толщина)]
+        # Инициализация калибровочных переменных
+        self.calib_hall_value = tk.DoubleVar()
+        self.calib_thickness = tk.DoubleVar()
+        self.calibration_points = []
         self.last_measurements = []
         self.max_measurements = 10
-        
-        self.hall_min_range = tk.DoubleVar(value=-670.0)
-        self.hall_max_range = tk.DoubleVar(value=670.0)
 
+        # Создаем остальные элементы интерфейса
         self.create_hall_range_settings()
-
-        # Загружаем сохраненные данные при старте
-        self.load_saved_data()
-
         self.create_calibration_panel()
         self.create_last_measurements_panel()
 
+        # Загружаем сохраненные данные
+        self.load_saved_data()    
+
+    def create_tabs(self):
+        """Создание вкладок приложения"""
+        self.tab_control = ttk.Notebook(self.root)
+        
+        # Создаем вкладки
+        self.connection_tab = ttk.Frame(self.tab_control)
+        self.settings_tab = ttk.Frame(self.tab_control)
+        self.visuals_tab = ttk.Frame(self.tab_control)
+        self.history_tab = ttk.Frame(self.tab_control)
+        
+        self.tab_control.add(self.connection_tab, text="Modbus TCP")
+        self.tab_control.add(self.settings_tab, text="Металл")
+        self.tab_control.add(self.visuals_tab, text="Данные")
+        self.tab_control.add(self.history_tab, text="История")
+    
+        self.tab_control.pack(expand=1, fill="both")
 
     def initialize_variables(self):
         """Инициализация основных переменных"""
+        # Modbus конфигурация поключения
         self.modbus_ip = tk.StringVar(value="192.168.31.169")
         self.modbus_port = tk.IntVar(value=502)
         self.slave_id = tk.IntVar(value=1)
+        
+        # Measurement parameters
         self.sensor_distance = tk.DoubleVar(value=0.05)
         self.sample_count = tk.IntVar(value=200)
         self.metal_temp = tk.DoubleVar(value=20.0)
+
+        # Параметры материала
         self.base_thickness = tk.DoubleVar(value=10.0)
         self.material_coef = tk.DoubleVar(value=0.005)
-
+        self.mu = tk.DoubleVar(value=5000)
+        self.hall_min = tk.DoubleVar(value=-670)
+        self.hall_max = tk.DoubleVar(value=670)
+        
+        # Размерность датчика Холла
+        self.hall_min_range = tk.DoubleVar(value=-670.0)
+        self.hall_max_range = tk.DoubleVar(value=670.0)
+        
+        # Data storage
         self.scan_data = {
             "distances": [],
             "front_sensor": [],
@@ -85,56 +161,101 @@ class MFLScannerApp:
         self.current_values = {}
         self.auto_update_interval = 1.0  # Интервал автообновления в секундах
 
-        # История значений (хранит значения и временные метки)
+        # История значений
         self.history = {reg.name: {'values': deque(maxlen=100), 'timestamps': deque(maxlen=100)} 
                        for reg in self.registers}
         self.history_lock = Lock()
-        self.byteorder = tk.StringVar(value="BIG")  # BIG или LITTLE
-        self.wordorder = tk.StringVar(value="BIG")  # BIG или LITTLE
 
-        # Сигнализация
+        self.byteorder = tk.StringVar(value="BIG")
+        self.wordorder = tk.StringVar(value="BIG")
+
         self.alarm_sound_enabled = tk.BooleanVar(value=True)
         self.alarm_flash_enabled = tk.BooleanVar(value=True)
         self.alarm_flash_state = False
         self.alarm_status = {reg.name: False for reg in self.registers}
 
-        # Для автоматической остановки автообновления
         self.stop_event = Event()
+        self.auto_update_var = tk.BooleanVar(value=False)
+
+    @property
+    def registers(self):
+        """Список зарегистрированных регистров"""
+        return [
+            Register("Расстояние", 0, "float"),
+            Register("Передний датчик", 2, "float"),
+            Register("Задний датчик", 4, "float"),
+            Register("Температура", 6, "float")
+        ]
+
+    def setup_logging(self):
+        """Настройка журнала логирования"""
+        logging.basicConfig(
+            filename='mfl_scanner.log',
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+        self.logger = logging.getLogger()
 
     def create_gui_elements(self):
         """Создание графического интерфейса"""
-        # Создание вкладок
-        tab_control = ttk.Notebook(self.root)
-        
-        # Вкладки
-        connection_tab = ttk.Frame(tab_control)
-        settings_tab = ttk.Frame(tab_control)
-        visuals_tab = ttk.Frame(tab_control)
-        history_tab = ttk.Frame(tab_control)
-        
-        tab_control.add(connection_tab, text="Modbus TCP")
-        tab_control.add(settings_tab, text="Металл")
-        tab_control.add(visuals_tab, text="Данные")
-        tab_control.add(history_tab, text="История")
-        tab_control.pack(expand=1, fill="both")
-        
         # Настройки соединения
-        self.create_connection_panel(connection_tab)
+        self.create_connection_panel(self.connection_tab)
         
         # Настройки параметров металла
-        self.create_metal_settings_panel(settings_tab)
+        self.create_metal_settings_panel(self.settings_tab)
         
         # Регистры Modbus
-        self.create_registers_panel(visuals_tab)
+        self.create_registers_panel(self.visuals_tab)
         
         # Управление данными
-        self.create_data_visualization_panel(visuals_tab)
+        self.create_data_visualization_panel(self.visuals_tab)
         
         # История данных
-        self.create_history_panel(history_tab)
+        self.create_history_panel(self.history_tab)
         
         # Дополнительные элементы управления
         self.create_additional_controls()
+
+    def create_metal_settings_panel(self, parent):
+        """Панель параметров металла и датчика"""
+        frame = ttk.LabelFrame(parent, text="Параметры металла и датчика")
+        frame.pack(padx=10, pady=5, fill="x")
+
+        # Используем уже инициализированные переменные
+        ttk.Label(frame, text="Базовая толщина (мм):").grid(row=0, column=0, sticky="e")
+        ttk.Entry(frame, textvariable=self.base_thickness, width=10).grid(row=0, column=1)
+
+        ttk.Label(frame, text="Магнитная проницаемость:").grid(row=1, column=0, sticky="e")
+        ttk.Entry(frame, textvariable=self.mu, width=10).grid(row=1, column=1)
+
+        ttk.Label(frame, text="Диапазон датчика (min):").grid(row=2, column=0, sticky="e")
+        ttk.Entry(frame, textvariable=self.hall_min, width=10).grid(row=2, column=1)
+
+        ttk.Label(frame, text="Диапазон датчика (max):").grid(row=3, column=0, sticky="e")
+        ttk.Entry(frame, textvariable=self.hall_max, width=10).grid(row=3, column=1)
+
+        ttk.Label(frame, text="Расстояние до поверхности (мм):").grid(row=4, column=0, sticky="e")
+        ttk.Entry(frame, textvariable=self.sensor_distance, width=10).grid(row=4, column=1)
+
+        ttk.Button(frame, text="Применить параметры",
+                command=self.apply_material_params).grid(row=5, columnspan=2, pady=5)
+
+    def apply_material_params(self):
+        """Применение новых параметров"""
+        try:
+            # Проверяем, что переменные существуют
+            if not hasattr(self, 'base_thickness') or not hasattr(self, 'mu'):
+                return
+            
+            # Получаем значения с проверкой
+            base_thickness = self.base_thickness.get() if self.base_thickness else 10.0
+            mu = self.mu.get() if self.mu else 5000
+            
+            # Здесь можно добавить валидацию значений
+            messagebox.showinfo("Успех", "Параметры успешно применены")
+            self.update_thickness_calculation()  # Обновляем расчеты
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Неверные параметры: {str(e)}")
 
     def create_connection_panel(self, parent):
         """Панель настройки соединения с устройством"""
@@ -153,22 +274,48 @@ class MFLScannerApp:
         ttk.Button(frame, text="Проверить подключение",
                  command=self.test_connection).grid(row=3, column=0, columnspan=2, pady=5)
 
-    def create_metal_settings_panel(self, parent):
-        """Панель настройки параметров металла"""
-        frame = ttk.LabelFrame(parent, text="Параметры металла")
+    def create_material_settings(self):
+        """Панель параметров материала"""
+        frame = ttk.LabelFrame(self.root, text="Параметры материала")
         frame.pack(padx=10, pady=5, fill="x")
         
-        ttk.Label(frame, text="Температура металла (°C):").grid(row=0, column=0, sticky="e")
-        ttk.Entry(frame, textvariable=self.metal_temp).grid(row=0, column=1)
+        # Поля ввода параметров
+        ttk.Label(frame, text="Магнитная проницаемость (μ):").grid(row=0, column=0)
+        self.mu_var = tk.DoubleVar(value=5000)
+        ttk.Entry(frame, textvariable=self.mu_var).grid(row=0, column=1)
         
-        ttk.Label(frame, text="Базовая толщина (мм):").grid(row=1, column=0, sticky="e")
-        ttk.Entry(frame, textvariable=self.base_thickness).grid(row=1, column=1)
+        ttk.Label(frame, text="Намагниченность (А/м):").grid(row=1, column=0)
+        self.ms_var = tk.DoubleVar(value=1.6e6)
+        ttk.Entry(frame, textvariable=self.ms_var).grid(row=1, column=1)
         
-        ttk.Label(frame, text="Коэффициент материала:").grid(row=2, column=0, sticky="e")
-        ttk.Entry(frame, textvariable=self.material_coef).grid(row=2, column=1)
+        ttk.Label(frame, text="Темп. коэффициент:").grid(row=2, column=0)
+        self.alpha_var = tk.DoubleVar(value=0.003)
+        ttk.Entry(frame, textvariable=self.alpha_var).grid(row=2, column=1)
         
-        ttk.Label(frame, text="Расстояние между датчиками (м):").grid(row=3, column=0, sticky="e")
-        ttk.Entry(frame, textvariable=self.sensor_distance).grid(row=3, column=1)
+        ttk.Label(frame, text="Расстояние (м):").grid(row=3, column=0)
+        self.h_var = tk.DoubleVar(value=0.002)
+        ttk.Entry(frame, textvariable=self.h_var).grid(row=3, column=1)
+        
+        ttk.Button(frame, text="Применить", 
+                command=self.update_material_params).grid(row=4, columnspan=2)
+
+    def update_material_params(self):
+        """Обновление параметров материала"""
+        self.calculator.set_material_params(
+            self.mu_var.get(),
+            self.ms_var.get(),
+            self.alpha_var.get(),
+            self.h_var.get()
+        )
+        messagebox.showinfo("Успех", "Параметры материала обновлены")
+
+    def update_calibration_list(self):
+        """Обновление списка точек калибровки"""
+        if hasattr(self, 'calibration_listbox'):
+            self.calibration_listbox.delete(0, tk.END)
+            for point in sorted(self.calibration_points, key=lambda x: x[0]):
+                self.calibration_listbox.insert(tk.END, f"{point[0]:.1f} → {point[1]:.2f} мм")
+
 
     def create_registers_panel(self, parent):
         """Таблица регистров Modbus"""
@@ -443,52 +590,46 @@ class MFLScannerApp:
 
     def calculate_thickness(self, hall_value, temperature=20.0):
         """
-        Корректный расчет толщины металла с учетом:
-        - калибровки датчика
-        - температурной компенсации
-        - физических ограничений
+        Расчет толщины по методике Никитина-Гобова
+        с учетом температурной компенсации
         """
         try:
-            # 1. Проверка и ограничение входного значения
-            min_val = self.hall_min_range.get()
-            max_val = self.hall_max_range.get()
-            hall_value = np.clip(hall_value, min_val, max_val)
+            if None in [self.base_thickness, self.hall_min, self.hall_max]:
+                return 0.1
+            base_thickness = self.base_thickness.get() if self.base_thickness else 10.0
+            hall_min = self.hall_min.get() if self.hall_min else -670
+            hall_max = self.hall_max.get() if self.hall_max else 670
+            # Параметры материала (примерные значения)
+            mu = 5000       # Относительная магнитная проницаемость
+            Ms = 1.6e6      # Намагниченность насыщения (А/м)
+            h = 0.002       # Расстояние датчик-поверхность (м)
             
-            # 2. Если есть точки калибровки, используем интерполяцию
-            if len(self.calibration_points) >= 2:
-                # Сортируем точки калибровки по значению датчика
-                sorted_points = sorted(self.calibration_points, key=lambda x: x[0])
-                x = [p[0] for p in sorted_points]
-                y = [p[1] for p in sorted_points]
-                
-                # Создаем интерполяционную функцию
-                interp_func = interp1d(
-                    x, y, 
-                    kind='linear',
-                    bounds_error=False,
-                    fill_value=(y[0], y[-1]))  # Экстраполяция крайними значениями
-                
-                # Получаем толщину без учета температуры
-                base_thickness = float(interp_func(hall_value))
+            # Температурная коррекция
+            alpha = 0.003   # Температурный коэффициент
+            temp_factor = 1 + alpha * (temperature - 20)
+            
+            # Нормировка сигнала
+            norm_signal = (hall_value - self.hall_min.get()) / (self.hall_max.get() - self.hall_min.get())
+            
+            # Основной расчет (упрощенная модель)
+            if self.calibration_points:
+                # Если есть калибровка, используем интерполяцию
+                x = [p[0] for p in self.calibration_points]
+                y = [p[1] for p in self.calibration_points]
+                thickness = np.interp(hall_value, x, y)
             else:
-                # 3. Если калибровки нет, используем стандартную формулу
-                normalized = ((hall_value - min_val) / (max_val - min_val))
+                # Аналитическое решение для плоской стенки
+                C = (mu * Ms * h) / (2 * self.base_thickness.get())
+                thickness = (C / (norm_signal + 1e-10)) * temp_factor
                 
-                # Линейная зависимость (можно заменить на более сложную модель)
-                base_thickness = self.base_thickness.get() - (
-                    (normalized - 0.5) * 2 * self.material_coef.get() * 100)
-            
-            # 4. Температурная компенсация
-            temp_coef = 0.003  # Коэффициент температурного расширения
-            temp_factor = 1 + temp_coef * (temperature - 20)
-            thickness = base_thickness * temp_factor
-            
-            # 5. Физические ограничения
-            return max(min(thickness, self.base_thickness.get() * 1.5), 0.1)
+                # Ограничиваем минимальную толщину
+                thickness = max(thickness, 0.1)
+                
+            return thickness
             
         except Exception as e:
-            self.logger.error(f"Ошибка расчета толщины: {str(e)}\n{traceback.format_exc()}")
-            return 0.1  # Возвращаем минимальную толщину при ошибке
+            self.logger.error(f"Ошибка расчета: {str(e)}")
+            return 0.1
 
 
     def visualize_data(self):
@@ -800,6 +941,24 @@ class MFLScannerApp:
     def find_register(self, name):
         """Поиск регистра по имени"""
         return next((reg for reg in self.registers if reg.name == name), None)
+
+    def plot_calibration_curve(self):
+        """Построение калибровочной кривой"""
+        if not self.calibration_points:
+            messagebox.showerror("Ошибка", "Нет данных калибровки")
+            return
+        
+        x = [p[0] for p in self.calibration_points]
+        y = [p[1] for p in self.calibration_points]
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(x, y, 'o-', label="Калибровочная кривая")
+        plt.xlabel("Значение датчика Холла")
+        plt.ylabel("Толщина (мм)")
+        plt.title("Зависимость толщины от показаний датчика")
+        plt.grid(True)
+        plt.legend()
+        plt.show()
 
     def plot_thickness(self):
         """Построение графика толщины металла"""
