@@ -1,4 +1,4 @@
 numpy = 2.2.4
-matplotlib = 3.10.1
+matplotlib = 3.10
 pymodbus = 3.9.1
 scipy = 1.15.2
